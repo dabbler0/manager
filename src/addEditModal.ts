@@ -2,6 +2,8 @@ import type { Task } from './types';
 import { tasks, saveTasks } from './state';
 import { genId, esc } from './utils';
 import { openModal, closeModal } from './modal';
+import { mountDatePicker, type DatePickerHandle } from './datepicker';
+import { mountDepPicker, type DepPickerHandle } from './depPicker';
 
 interface FormValues {
   title: string;
@@ -12,33 +14,18 @@ interface FormValues {
   deps: string[];
 }
 
-function readForm(overlay: HTMLElement): FormValues | null {
+function readForm(overlay: HTMLElement, dp: DatePickerHandle, ddp: DepPickerHandle): FormValues | null {
   const title = overlay.querySelector<HTMLInputElement>('#fTitle')!.value.trim();
   if (!title) { alert('Title is required'); return null; }
 
-  const dueRaw = overlay.querySelector<HTMLInputElement>('#fDue')!.value;
   const costOfFailure    = parseFloat(overlay.querySelector<HTMLInputElement>('#fCost')!.value)    || 0;
   const benefitOfSuccess = parseFloat(overlay.querySelector<HTMLInputElement>('#fBenefit')!.value) || 0;
   const estimatedHours   = parseFloat(overlay.querySelector<HTMLInputElement>('#fHours')!.value)   || 1;
-  const deps = Array.from(overlay.querySelector<HTMLSelectElement>('#fDeps')!.selectedOptions).map(o => o.value);
 
-  return {
-    title,
-    dueDate: dueRaw ? new Date(dueRaw).toISOString() : null,
-    costOfFailure,
-    benefitOfSuccess,
-    estimatedHours,
-    deps,
-  };
+  return { title, dueDate: dp.getValue(), costOfFailure, benefitOfSuccess, estimatedHours, deps: ddp.getSelected() };
 }
 
 function formHtml(task: Task | null, modalTitle: string): string {
-  const candidates = tasks.filter(t => t.id !== task?.id);
-  const depIds = task?.deps ?? [];
-  const depOptions = candidates.map(t =>
-    `<option value="${t.id}" ${depIds.includes(t.id) ? 'selected' : ''}>${esc(t.title)}</option>`
-  ).join('');
-
   return `
     <h2>${modalTitle}</h2>
     <div class="form-row">
@@ -46,8 +33,8 @@ function formHtml(task: Task | null, modalTitle: string): string {
       <input id="fTitle" value="${esc(task?.title ?? '')}" placeholder="Task name" />
     </div>
     <div class="form-row">
-      <label>Due date/time (leave blank for "sometime")</label>
-      <input id="fDue" type="datetime-local" value="${task?.dueDate ? task.dueDate.slice(0, 16) : ''}" />
+      <label>Due date / time</label>
+      <div id="fDuePicker"></div>
     </div>
     <div style="display:flex;gap:12px;">
       <div class="form-row" style="flex:1">
@@ -64,8 +51,8 @@ function formHtml(task: Task | null, modalTitle: string): string {
       <input id="fHours" type="number" min="0.1" step="0.25" value="${task?.estimatedHours ?? 1}" />
     </div>
     <div class="form-row">
-      <label>Dependencies (hold Ctrl/Cmd to select multiple)</label>
-      <select id="fDeps" multiple style="height:80px;">${depOptions}</select>
+      <label>Dependencies</label>
+      <div id="fDepPicker"></div>
     </div>
     <div class="modal-footer">
       <button class="btn-ghost" id="btnCancel">Cancel</button>
@@ -74,11 +61,20 @@ function formHtml(task: Task | null, modalTitle: string): string {
   `;
 }
 
+function mountComponents(overlay: HTMLElement, task: Task | null): { dp: DatePickerHandle; ddp: DepPickerHandle } {
+  const candidates = tasks.filter(t => t.id !== task?.id);
+  const dp  = mountDatePicker(overlay.querySelector<HTMLElement>('#fDuePicker')!,  task?.dueDate ?? null);
+  const ddp = mountDepPicker(overlay.querySelector<HTMLElement>('#fDepPicker')!, candidates, task?.deps ?? []);
+  return { dp, ddp };
+}
+
 export function openAddModal(onSave: () => void): void {
   const overlay = openModal(formHtml(null, 'New Task'));
+  const { dp, ddp } = mountComponents(overlay, null);
+
   overlay.querySelector('#btnCancel')!.addEventListener('click', closeModal);
   overlay.querySelector('#btnSave')!.addEventListener('click', () => {
-    const values = readForm(overlay);
+    const values = readForm(overlay, dp, ddp);
     if (!values) return;
     tasks.push({ id: genId(), done: false, ...values });
     saveTasks();
@@ -92,9 +88,11 @@ export function openEditModal(id: string, onSave: () => void): void {
   if (!task) return;
 
   const overlay = openModal(formHtml(task, 'Edit Task'));
+  const { dp, ddp } = mountComponents(overlay, task);
+
   overlay.querySelector('#btnCancel')!.addEventListener('click', closeModal);
   overlay.querySelector('#btnSave')!.addEventListener('click', () => {
-    const values = readForm(overlay);
+    const values = readForm(overlay, dp, ddp);
     if (!values) return;
     Object.assign(task, values);
     saveTasks();

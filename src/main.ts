@@ -6,6 +6,7 @@ import { renderTasks } from './tasks';
 import { openAddModal } from './addEditModal';
 import { openEditModal } from './addEditModal';
 import { openSplitModal } from './splitModal';
+import { exportTasks, openImportModal } from './importExport';
 
 function render(): void {
   const hoursPerDay = parseFloat(
@@ -29,7 +30,9 @@ function deleteTask(id: string): void {
 }
 
 // ── Controls ────────────────────────────────────────────
-document.getElementById('btnAdd')!.addEventListener('click', () => openAddModal(render));
+document.getElementById('btnAdd')!.addEventListener('click',    () => openAddModal(render));
+document.getElementById('btnExport')!.addEventListener('click', () => exportTasks());
+document.getElementById('btnImport')!.addEventListener('click', () => openImportModal(render));
 document.getElementById('hoursPerDay')!.addEventListener('change', render);
 document.getElementById('searchInput')!.addEventListener('input', render);
 document.getElementById('showDone')!.addEventListener('change', render);
