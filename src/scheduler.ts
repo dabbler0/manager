@@ -15,18 +15,22 @@ export interface ScheduleResult {
   firstValueD?: number;
 }
 
+// Above this task count we fall back to greedy heuristics (2^n · n becomes too slow)
+const BITMASK_THRESHOLD = 20;
+
+// ── Shared helpers ─────────────────────────────────────
+
 interface DepGraph {
   taskMap: Map<string, Task>;
   inDegree: Map<string, number>;
-  /** reverse dependency map: depId → list of task IDs that depend on it */
   rdeps: Map<string, string[]>;
 }
 
 function buildDepGraph(taskSet: Task[]): DepGraph {
-  const idSet = new Set(taskSet.map(t => t.id));
+  const idSet  = new Set(taskSet.map(t => t.id));
   const taskMap = new Map(taskSet.map(t => [t.id, t]));
   const inDegree = new Map(taskSet.map(t => [t.id, 0]));
-  const rdeps = new Map(taskSet.map(t => [t.id, [] as string[]]));
+  const rdeps    = new Map(taskSet.map(t => [t.id, [] as string[]]));
 
   for (const t of taskSet) {
     for (const depId of t.deps) {
@@ -39,154 +43,261 @@ function buildDepGraph(taskSet: Task[]): DepGraph {
   return { taskMap, inDegree, rdeps };
 }
 
+// ── Problem 1: Minimize cost of missed deadlines ────────
+
 /**
- * Greedy Earliest-Deadline-First schedule.
- * Returns the ordered sequence and any tasks that missed their wall-clock deadline.
+ * Exact solution via bitmask DP.
+ *
+ * State: dp[mask] = (minCost, minTimeAtMinCost) for completing exactly the tasks
+ * in `mask` in some valid topological order.
+ *
+ * Transition: for each ready task i (all its deps are in mask), compute
+ *   newTime = time[mask] + hours[i]
+ *   newCost = cost[mask] + (newTime > deadline[i] ? costOfFailure[i] : 0)
+ * Update dp[mask | (1<<i)] if (newCost, newTime) is lexicographically better.
+ *
+ * Correctness: masks are processed in increasing numeric order; since mask|(1<<i) > mask
+ * always, every source state is finalized before its successors.
+ *
+ * Complexity: O(2^n · n). Only called when n ≤ BITMASK_THRESHOLD.
  */
-function greedyEDF(
-  taskSet: Task[],
+function exactMinCostDP(
+  tasks: Task[],
+  deadlineHours: (t: Task) => number,
+): { sequence: Task[]; missed: Task[]; totalCost: number } {
+  const n = tasks.length;
+  const idSet   = new Set(tasks.map(t => t.id));
+  const taskIdx = new Map(tasks.map((t, i) => [t.id, i]));
+
+  // Precompute dependency bitmask for each task (within this task set only)
+  const depMask = tasks.map(t => {
+    let m = 0;
+    for (const depId of t.deps) {
+      if (idSet.has(depId)) m |= (1 << taskIdx.get(depId)!);
+    }
+    return m;
+  });
+
+  const size = 1 << n;
+  const dpCost: number[] = new Array(size).fill(Infinity);
+  const dpTime: number[] = new Array(size).fill(Infinity);
+  const parentMask: number[] = new Array(size).fill(-1);
+  const parentTask: number[] = new Array(size).fill(-1);
+
+  dpCost[0] = 0;
+  dpTime[0] = 0;
+
+  for (let mask = 0; mask < size; mask++) {
+    if (dpCost[mask] === Infinity) continue;
+
+    const curCost = dpCost[mask];
+    const curTime = dpTime[mask];
+
+    for (let i = 0; i < n; i++) {
+      if (mask & (1 << i)) continue;                     // already scheduled
+      if ((mask & depMask[i]) !== depMask[i]) continue;  // dependencies not yet done
+
+      const t = tasks[i];
+      const newTime = curTime + t.estimatedHours;
+      const missed  = t.dueDate !== null && newTime > deadlineHours(t);
+      const newCost = curCost + (missed ? (t.costOfFailure ?? 0) : 0);
+      const newMask = mask | (1 << i);
+
+      if (newCost < dpCost[newMask] ||
+          (newCost === dpCost[newMask] && newTime < dpTime[newMask])) {
+        dpCost[newMask] = newCost;
+        dpTime[newMask] = newTime;
+        parentMask[newMask] = mask;
+        parentTask[newMask] = i;
+      }
+    }
+  }
+
+  // Reconstruct optimal sequence
+  const fullMask = size - 1;
+  const sequence: Task[] = [];
+  let cur = fullMask;
+  while (cur !== 0) {
+    const ti = parentTask[cur];
+    sequence.unshift(tasks[ti]);
+    cur = parentMask[cur];
+  }
+
+  // Recompute missed list from the reconstructed sequence
+  const missed: Task[] = [];
+  let elapsed = 0;
+  for (const t of sequence) {
+    elapsed += t.estimatedHours;
+    if (t.dueDate !== null && elapsed > deadlineHours(t)) missed.push(t);
+  }
+
+  return { sequence, missed, totalCost: dpCost[fullMask] };
+}
+
+/**
+ * Greedy heuristic fallback for large n (> BITMASK_THRESHOLD).
+ * Runs both EDF and cost-rate-weighted order, returns the lower-cost result.
+ */
+function heuristicMinCost(
+  sorted: Task[],
   hoursUntilDeadline: (t: Task) => number,
   now: Date,
 ): { sequence: Task[]; missed: Task[]; totalCost: number } {
-  const { taskMap, inDegree, rdeps } = buildDepGraph(taskSet);
-  let currentHours = 0;
-  const sequence: Task[] = [];
-  const missed: Task[] = [];
-  const ready: Task[] = taskSet.filter(t => inDegree.get(t.id) === 0);
+  function simulate(taskSet: Task[]): { sequence: Task[]; missed: Task[]; totalCost: number } {
+    const { taskMap, inDegree, rdeps } = buildDepGraph(taskSet);
+    let currentHours = 0;
+    const sequence: Task[] = [];
+    const missed: Task[]   = [];
+    const ready: Task[]    = taskSet.filter(t => inDegree.get(t.id) === 0);
 
-  while (ready.length > 0) {
-    ready.sort((a, b) => {
-      const diff = hoursUntilDeadline(a) - hoursUntilDeadline(b);
-      // Tie-break by cost of failure descending
-      return diff !== 0 ? diff : (b.costOfFailure ?? 0) - (a.costOfFailure ?? 0);
-    });
-
-    const t = ready.shift()!;
-    currentHours += t.estimatedHours;
-
-    if (t.dueDate) {
-      const wallEnd = new Date(now.getTime() + currentHours * 3_600_000);
-      if (wallEnd > new Date(t.dueDate)) missed.push(t);
+    while (ready.length > 0) {
+      ready.sort((a, b) => {
+        const diff = hoursUntilDeadline(a) - hoursUntilDeadline(b);
+        return diff !== 0 ? diff : (b.costOfFailure ?? 0) - (a.costOfFailure ?? 0);
+      });
+      const t = ready.shift()!;
+      currentHours += t.estimatedHours;
+      if (t.dueDate) {
+        const wallEnd = new Date(now.getTime() + currentHours * 3_600_000);
+        if (wallEnd > new Date(t.dueDate)) missed.push(t);
+      }
+      sequence.push(t);
+      for (const rid of rdeps.get(t.id) ?? []) {
+        const deg = (inDegree.get(rid) ?? 1) - 1;
+        inDegree.set(rid, deg);
+        if (deg === 0) ready.push(taskMap.get(rid)!);
+      }
     }
-    sequence.push(t);
-
-    for (const rid of rdeps.get(t.id) ?? []) {
-      const deg = (inDegree.get(rid) ?? 1) - 1;
-      inDegree.set(rid, deg);
-      if (deg === 0) ready.push(taskMap.get(rid)!);
-    }
+    return { sequence, missed, totalCost: missed.reduce((s, t) => s + (t.costOfFailure ?? 0), 0) };
   }
 
-  return {
-    sequence,
-    missed,
-    totalCost: missed.reduce((s, t) => s + (t.costOfFailure ?? 0), 0),
-  };
+  const edf = simulate(sorted);
+  const costWeighted = simulate(
+    [...sorted].sort((a, b) => {
+      const rA = (a.costOfFailure ?? 0) / Math.max(1, hoursUntilDeadline(a));
+      const rB = (b.costOfFailure ?? 0) / Math.max(1, hoursUntilDeadline(b));
+      return rB - rA;
+    })
+  );
+  return costWeighted.totalCost <= edf.totalCost ? costWeighted : edf;
 }
+
+// ── Problem 2: Maximize S/D ─────────────────────────────
 
 /**
- * Greedy S/D maximization schedule.
+ * Exact solution to the maximize-S/D problem.
  *
- * At each step, pick the ready task (no unfinished deps) with the highest S/D where:
- *   S = costOfFailure + benefitOfSuccess
- *   D = cumulative hours until that task completes
+ * For a given choice of "first valuable task" T, the minimum achievable D is:
+ *   D_min(T) = Σ hours(all transitive prerequisites of T) + T.estimatedHours
  *
- * Zero-value tasks (S=0) are scheduled shortest-first to unblock valuable tasks sooner.
- * Stops after the first task T with nonzero S is scheduled.
+ * This is because we must complete every transitive prerequisite before T, and
+ * inserting any non-prerequisite task before T would only increase D (hurting S/D).
+ *
+ * Therefore the globally optimal T* = argmax { S(T) / D_min(T) } over tasks with S > 0.
+ * The optimal sequence is: topoSort(prerequisites of T*), then T*.
+ *
+ * Complexity: O(n²).
  */
-function greedyMaxSD(taskSet: Task[]): Task[] {
-  const { taskMap, inDegree, rdeps } = buildDepGraph(taskSet);
-  let currentHours = 0;
-  const sequence: Task[] = [];
-  const ready: Task[] = taskSet.filter(t => inDegree.get(t.id) === 0);
-  let foundFirstValueTask = false;
+export function exactMaxSD(taskSet: Task[]): Task[] {
+  const idSet   = new Set(taskSet.map(t => t.id));
+  const taskMap = new Map(taskSet.map(t => [t.id, t]));
 
-  while (ready.length > 0) {
-    let best: Task | null = null;
-    let bestScore = -Infinity;
-
-    for (const t of ready) {
-      const S = (t.costOfFailure ?? 0) + (t.benefitOfSuccess ?? 0);
-      const D = currentHours + t.estimatedHours;
-      const score =
-        !foundFirstValueTask && S > 0 ? S / Math.max(0.01, D) // maximize S/D for first valuable task
-        : !foundFirstValueTask        ? -D                     // minimize time for zero-value pre-tasks
-        :                               0;                     // irrelevant after T is found
-      if (score > bestScore) { bestScore = score; best = t; }
+  function transitivePrereqs(start: Task): Task[] {
+    const seen  = new Set<string>();
+    const stack = start.deps.filter(id => idSet.has(id));
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      taskMap.get(id)?.deps.filter(d => idSet.has(d) && !seen.has(d)).forEach(d => stack.push(d));
     }
+    return [...seen].map(id => taskMap.get(id)!);
+  }
 
-    const t = best!;
-    ready.splice(ready.indexOf(t), 1);
-    currentHours += t.estimatedHours;
-    sequence.push(t);
+  let bestRatio   = -Infinity;
+  let bestTarget: Task | null = null;
+  let bestPrereqs: Task[] = [];
 
-    const S = (t.costOfFailure ?? 0) + (t.benefitOfSuccess ?? 0);
-    if (!foundFirstValueTask && S > 0) foundFirstValueTask = true;
+  for (const T of taskSet) {
+    const S = (T.costOfFailure ?? 0) + (T.benefitOfSuccess ?? 0);
+    if (S <= 0) continue;
 
-    for (const rid of rdeps.get(t.id) ?? []) {
-      const deg = (inDegree.get(rid) ?? 1) - 1;
-      inDegree.set(rid, deg);
-      if (deg === 0) ready.push(taskMap.get(rid)!);
+    const prereqs     = transitivePrereqs(T);
+    const prereqHours = prereqs.reduce((s, t) => s + t.estimatedHours, 0);
+    const D           = prereqHours + T.estimatedHours;
+    const ratio       = S / Math.max(0.001, D);
+
+    if (ratio > bestRatio) {
+      bestRatio   = ratio;
+      bestTarget  = T;
+      bestPrereqs = prereqs;
     }
   }
 
-  return sequence;
+  // No task with nonzero value — return a valid topo ordering
+  if (!bestTarget) return topoSort(taskSet);
+
+  return [...topoSort(bestPrereqs), bestTarget];
 }
 
-export function scheduleAndRecommend(allTasks: Task[], hoursPerDay: number): ScheduleResult {
-  const now = new Date();
+// ── Main entry point ────────────────────────────────────
+
+/**
+ * Compute the recommended task sequence.
+ *
+ * @param now  Reference time for deadline calculations (defaults to the current time;
+ *             injectable for deterministic testing).
+ */
+export function scheduleAndRecommend(
+  allTasks: Task[],
+  hoursPerDay: number,
+  now: Date = new Date(),
+): ScheduleResult {
   const pending = allTasks.filter(t => !t.done);
   if (pending.length === 0) return { mode: 'empty', sequence: [], first: null };
 
   const sorted = topoSort(pending);
 
-  function hoursUntilDeadline(t: Task): number {
+  function deadlineHours(t: Task): number {
     if (!t.dueDate) return Infinity;
     return Math.max(0, (new Date(t.dueDate).getTime() - now.getTime()) / 3_600_000);
   }
 
-  const edf = greedyEDF(sorted, hoursUntilDeadline, now);
+  // Determine the minimum achievable miss-cost (also serves as the feasibility check)
+  const minCostResult = pending.length <= BITMASK_THRESHOLD
+    ? exactMinCostDP(pending, deadlineHours)
+    : heuristicMinCost(sorted, deadlineHours, now);
 
-  if (edf.missed.length > 0) {
-    // Try cost-rate weighted order as an alternative to EDF and keep the better result
-    const costWeighted = [...sorted].sort((a, b) => {
-      const rA = (a.costOfFailure ?? 0) / Math.max(1, hoursUntilDeadline(a));
-      const rB = (b.costOfFailure ?? 0) / Math.max(1, hoursUntilDeadline(b));
-      return rB - rA;
-    });
-    const cw = greedyEDF(costWeighted, hoursUntilDeadline, now);
-    const best = cw.totalCost <= edf.totalCost ? cw : edf;
+  if (minCostResult.totalCost > 0) {
     return {
       mode: 'minimize-cost',
-      sequence: best.sequence,
-      first: best.sequence[0] ?? null,
-      missed: best.missed,
-      totalCost: best.totalCost,
+      sequence: minCostResult.sequence,
+      first:    minCostResult.sequence[0] ?? null,
+      missed:   minCostResult.missed,
+      totalCost: minCostResult.totalCost,
     };
   }
 
-  // All deadlines feasible — build maximize-S/D sequence up to first valuable task T
-  const sdSequence = greedyMaxSD(sorted);
+  // All deadlines feasible — maximize S/D
+  const sdSequence = exactMaxSD(sorted);
   let firstValueTask: Task | null = null;
   let firstValueD = 0;
-  const displaySequence: Task[] = [];
   let hours = 0;
 
   for (const t of sdSequence) {
     hours += t.estimatedHours;
-    displaySequence.push(t);
     const S = (t.costOfFailure ?? 0) + (t.benefitOfSuccess ?? 0);
     if (S > 0 && !firstValueTask) {
       firstValueTask = t;
-      firstValueD = hours;
+      firstValueD    = hours;
       break;
     }
   }
 
   return {
     mode: 'maximize-sd',
-    sequence: displaySequence,
-    first: displaySequence[0] ?? null,
+    sequence: sdSequence,
+    first:    sdSequence[0] ?? null,
     firstValueTask,
     firstValueD,
   };
